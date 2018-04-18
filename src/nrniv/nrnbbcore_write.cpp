@@ -131,6 +131,8 @@ static void write_byteswap1(const char* fname);
 static void write_memb_mech_types(const char* fname);
 static void write_memb_mech_types(std::ostream& s);
 static void write_globals(const char* fname);
+static int get_global_int_item(const char* name);
+static void* get_global_dbl_item(void* p, const char* & name, int& size, double*& val);
 static void write_nrnthread(const char* fname, NrnThread& nt, CellGroup& cg);
 static void write_nrnthread_task(const char*, CellGroup* cgs);
 static int* datum2int(int type, Memb_list* ml, NrnThread& nt, CellGroup& cg, DatumIndices& di, int* ml_vdata_offset);
@@ -866,28 +868,68 @@ static void write_globals(const char* fname) {
   }
 
   fprintf(f, "%s\n", bbcore_write_version);
-  for (Symbol* sp = hoc_built_in_symlist->first; sp; sp = sp->next) {
-    if (sp->type == VAR && sp->subtype == USERDOUBLE) {
-      if (ISARRAY(sp)) {
-        Arrayinfo* a = sp->arayinfo;
-        if (a->nsub == 1) {
-          fprintf(f, "%s[%d]\n", sp->name, a->sub[0]);
-          for (int i=0; i < a->sub[0]; ++i) {
-            char n[256];
-            sprintf(n, "%s[%d]", sp->name, i);
-            fprintf(f, "%.20g\n", *hoc_val_pointer(n));
-          }
-        }
-      }else{
-        fprintf(f, "%s %.20g\n", sp->name, *sp->u.pval);
+  const char* name;
+  int size; // 0 means scalar, is 0 will still allocated one element for val.
+  double* val; // Allocated by new in get_global_item, must be delete [] here.
+  for (void* sp = NULL;
+        (sp = get_global_dbl_item(sp, name, size, val)) != NULL;) {
+    if (size) {
+      fprintf(f, "%s[%d]\n", name, size);
+      for (int i=0; i < size; ++i) {
+        fprintf(f, "%.20g\n", val[i]);
       }
+    }else{
+      fprintf(f, "%s %.20g\n", name, val[0]);
     }
+    delete [] val;
   }
   fprintf(f, "0 0\n"); 
   fprintf(f, "secondorder %d\n", secondorder);
   fprintf(f, "Random123_globalindex %d\n", nrnran123_get_globalindex());
 
   fclose(f);
+}
+
+// just for secondorder and Random123_globalindex
+static int get_global_int_item(const char* name) {
+  if (strcmp(name, "secondorder") == 0) {
+    return secondorder;
+  }else if(strcmp(name, "Random123_global_index") == 0) {
+    return nrnran123_get_globalindex();
+  }
+  return 0;
+}
+
+// successively return global double info. Begin with p==NULL.
+// Done when return NULL.
+static void* get_global_dbl_item(void* p, const char* & name, int& size, double*& val) {
+  Symbol* sp = (Symbol*)p;
+  if (sp == NULL) {
+    sp = hoc_built_in_symlist->first;
+  }
+  for (; sp; sp = sp->next) {
+    if (sp->type == VAR && sp->subtype == USERDOUBLE) {
+      name = sp->name;
+      if (ISARRAY(sp)) {
+        Arrayinfo* a = sp->arayinfo;
+        if (a->nsub == 1) {
+          size = a->sub[0];
+          val = new double[size];
+          for (int i=0; i < a->sub[0]; ++i) {
+            char n[256];
+            sprintf(n, "%s[%d]", sp->name, i);
+            val[i] =  *hoc_val_pointer(n);
+          }
+        }
+      }else{
+        size = 0;
+        val = new double[1];
+        val[0] = *sp->u.pval;
+      }
+      return sp->next;
+    }
+  }
+  return NULL;
 }
 
 void writeint_(int* p, size_t size, FILE* f) {
