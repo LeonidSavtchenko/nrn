@@ -78,6 +78,14 @@ nt->tml->pdata is not cache_efficient
 // See corebluron/src/simcore/nrniv/nrn_setup.cpp for a description of
 // the file format written by this file.
 
+/*
+Support direct transfer of model to dynamically loaded coreneuron library.
+To do this we factored all major file writing components into a series
+of functions that return data that can be called from the coreneuron
+library. The file writing functionality is kept by also calling those
+functions here as well.
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <nrnran123.h> // globalindex written to globals.dat
@@ -91,6 +99,8 @@ nt->tml->pdata is not cache_efficient
 #include <netcvode.h> // for nrnbbcore_vecplay_write
 #include <vrecitem.h> // for nrnbbcore_vecplay_write
 #include <nrnsection_mapping.h>
+#include <fstream>
+#include <sstream>
 
 extern NetCvode* net_cvode_instance;
 
@@ -117,7 +127,9 @@ extern bbcore_write_t* nrn_bbcore_write_;
 static CellGroup* mk_cellgroups(); // gid, PreSyn, NetCon, Point_process relation.
 static void datumtransform(CellGroup*); // Datum.pval to int
 static void datumindex_fill(int, CellGroup&, DatumIndices&, Memb_list*); //helper
+static void write_byteswap1(const char* fname);
 static void write_memb_mech_types(const char* fname);
+static void write_memb_mech_types(std::ostream& s);
 static void write_globals(const char* fname);
 static void write_nrnthread(const char* fname, NrnThread& nt, CellGroup& cg);
 static void write_nrnthread_task(const char*, CellGroup* cgs);
@@ -147,7 +159,7 @@ static NrnMappingInfo mapinfo;
 
 // to avoid incompatible dataset between neuron and coreneuron
 // add version string to the dataset files
-const char *bbcore_write_version = "1.1";
+const char *bbcore_write_version = "1.2";
 
 // accessible from ParallelContext.total_bytes()
 size_t nrnbbcore_write() {
@@ -176,6 +188,10 @@ size_t nrnbbcore_write() {
   }
   setup_nrn_has_net_event();
   mk_tml_with_art();
+
+  sprintf(fname, "%s/%s", path, "byteswap1.dat");
+  write_byteswap1(fname);
+
   sprintf(fname, "%s/%s", path, "bbcore_mech.dat");
   write_memb_mech_types(fname);
 
@@ -793,36 +809,47 @@ void datumindex_fill(int ith, CellGroup& cg, DatumIndices& di, Memb_list* ml) {
   }
 }
 
+static void write_byteswap1(const char* fname) {
+  if (nrnmpi_myid > 0) { return; } // only rank 0 writes this file
+  FILE* f = fopen(fname, "wb");
+  if (!f) {
+    hoc_execerror("nrnbbcore_write write_byteswap1 could not open for writing: %s\n", fname);
+  }
+  // write an endian sentinal value so reader can determine if byteswap needed.
+  int32_t x = 1;
+  fwrite(&x, sizeof(int32_t), 1, f);
+  fclose(f);
+}
+
 static void write_memb_mech_types(const char* fname) {
+  if (nrnmpi_myid > 0) { return; } // only rank 0 writes this file
+  std::ofstream fs(fname);
+  if (!fs.good()) {
+    hoc_execerror("nrnbbcore_write write_mem_mech_types could not open for writing: %s\n", fname);
+  }
+  write_memb_mech_types(fs);
+}
+
+static void write_memb_mech_types(std::ostream& s) {
   // list of Memb_func names, types, point type info, is_ion
   // and data, pdata instance sizes. If the mechanism is an eion type,
   // the following line is the charge.
   // Not all Memb_func are necessarily used in the model.
-  if (nrnmpi_myid > 0) { return; } // only rank 0 writes this file
-  FILE* f = fopen(fname, "wb");
-  if (!f) {
-    hoc_execerror("nrnbbcore_write write_mem_mech_types could not open for writing: %s\n", fname);
-  }
-  fprintf(f, "%s\n", bbcore_write_version);
-  fprintf(f, "%d\n", n_memb_func);
+  s << bbcore_write_version << endl;
+  s << n_memb_func << endl;
   for (int type=2; type < n_memb_func; ++type) {
+    const char* w = " ";
     Memb_func& mf = memb_func[type];
-    fprintf(f, "%s %d %d %d %d %d %d\n", mf.sym->name, type,
-      pnt_map[type], // the pointtype, 0 means not a POINT_PROCESS
-      nrn_is_artificial_[type],
-      nrn_is_ion(type),
-      nrn_prop_param_size_[type], bbcore_dparam_size[type]
-    );
+    s << mf.sym->name << w << type << w
+      << int(pnt_map[type]) << w // the pointtype, 0 means not a POINT_PROCESS
+      << nrn_is_artificial_[type] << w
+      << nrn_is_ion(type) << w
+      << nrn_prop_param_size_[type] << w << bbcore_dparam_size[type] << endl;
+
     if (nrn_is_ion(type)) {
-        fprintf(f, "%g\n", nrn_ion_charge(mf.sym));
+        s << nrn_ion_charge(mf.sym) << endl;
     }
   }
-
-  // tack on an endian sentinal value so reader can determine if byteswap needed.
-  int32_t x = 1.0;
-  fwrite(&x, sizeof(int32_t), 1, f);
-
-  fclose(f);
 }
 
 // format is name value
