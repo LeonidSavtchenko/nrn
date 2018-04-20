@@ -124,16 +124,19 @@ extern size_t nrnbbcore_gap_write(const char* path, int* group_ids);
 typedef void (*bbcore_write_t)(double*, int*, int*, int*, double*, Datum*, Datum*, NrnThread*);
 extern bbcore_write_t* nrn_bbcore_write_;
 
+static CellGroup* cellgroups_;
 static CellGroup* mk_cellgroups(); // gid, PreSyn, NetCon, Point_process relation.
 static void datumtransform(CellGroup*); // Datum.pval to int
 static void datumindex_fill(int, CellGroup&, DatumIndices&, Memb_list*); //helper
 static void write_byteswap1(const char* fname);
 static void write_memb_mech_types(const char* fname);
-static void write_memb_mech_types(std::ostream& s);
+static void write_memb_mech_types_direct(std::ostream& s);
 static void write_globals(const char* fname);
 static int get_global_int_item(const char* name);
 static void* get_global_dbl_item(void* p, const char* & name, int& size, double*& val);
 static void write_nrnthread(const char* fname, NrnThread& nt, CellGroup& cg);
+static void nrnthread_dat1(int tid, int& n_presyn, int& n_netcon,
+  int*& output_gid, int*& netcon_srcgid);
 static void write_nrnthread_task(const char*, CellGroup* cgs);
 static int* datum2int(int type, Memb_list* ml, NrnThread& nt, CellGroup& cg, DatumIndices& di, int* ml_vdata_offset);
 static void setup_nrn_has_net_event();
@@ -243,6 +246,7 @@ size_t nrnbbcore_write() {
   rankbytes += nrncore_netpar_bytes();
   //printf("%d bytes %ld\n", nrnmpi_myid, rankbytes);
   CellGroup* cgs = mk_cellgroups();
+  cellgroups_ = cgs;
   datumtransform(cgs);
   for (int i=0; i < nrn_nthread; ++i) {
     chkpnt = 0;
@@ -829,10 +833,10 @@ static void write_memb_mech_types(const char* fname) {
   if (!fs.good()) {
     hoc_execerror("nrnbbcore_write write_mem_mech_types could not open for writing: %s\n", fname);
   }
-  write_memb_mech_types(fs);
+  write_memb_mech_types_direct(fs);
 }
 
-static void write_memb_mech_types(std::ostream& s) {
+static void write_memb_mech_types_direct(std::ostream& s) {
   // list of Memb_func names, types, point type info, is_ion
   // and data, pdata instance sizes. If the mechanism is an eion type,
   // the following line is the charge.
@@ -1018,6 +1022,16 @@ static void nrnbbcore_vecplay_write(FILE* f, NrnThread& nt) {
   }
 }
 
+static void nrnthread_dat1(int tid, int& n_presyn, int& n_netcon,
+  int*& output_gid, int*& netcon_srcgid) {
+
+  CellGroup& cg = cellgroups_[tid];
+  n_presyn = cg.n_presyn;
+  n_netcon = cg.n_netcon;
+  output_gid = cg.output_gid;  cg.output_gid = NULL;
+  netcon_srcgid = cg.netcon_srcgid;  cg.netcon_srcgid = NULL;
+}
+
 void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
   char fname[1000];
   if (cg.n_output <= 0) { return; }
@@ -1032,6 +1046,8 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
   fprintf(f, "%d nnetcon\n", cg.n_netcon);
   writeint(cg.output_gid, cg.n_presyn);
   writeint(cg.netcon_srcgid, cg.n_netcon);
+  if (cg.output_gid) {delete [] cg.output_gid; cg.output_gid = NULL; }
+  if (cg.netcon_srcgid) {delete [] cg.netcon_srcgid; cg.netcon_srcgid = NULL; }
   fclose(f);
 
   sprintf(fname, "%s/%d_2.dat", path, cg.group_id);
