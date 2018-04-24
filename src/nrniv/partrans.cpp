@@ -1054,7 +1054,12 @@ static BBCoreGapInfo* gi; // array of size nthread
 static void nrnbbcore_gap_info();
 static void sidsort(int* sids, int cnt, int* indices);
 
-static void get_partrans_setup_info(int tid, int& ntar, int& nsrc,
+extern "C" {
+void get_partrans_setup_info(int tid, int& ntar, int& nsrc,
+  int& type, int& ix_vpre, int*& sid_target, int*& sid_src, int*& v_indices);
+}
+
+void get_partrans_setup_info(int tid, int& ntar, int& nsrc,
   int& type, int& ix_vpre, int*& sid_target, int*& sid_src, int*& v_indices) {
 
   if (tid == 0) { // first call

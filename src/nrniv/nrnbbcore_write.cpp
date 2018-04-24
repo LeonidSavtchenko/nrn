@@ -102,6 +102,8 @@ functions here as well.
 #include <fstream>
 #include <sstream>
 
+#include <dlfcn.h>
+
 extern NetCvode* net_cvode_instance;
 
 extern "C" { // to end of file
@@ -135,7 +137,7 @@ static void write_globals(const char* fname);
 static int get_global_int_item(const char* name);
 static void* get_global_dbl_item(void* p, const char* & name, int& size, double*& val);
 static void write_nrnthread(const char* fname, NrnThread& nt, CellGroup& cg);
-static void nrnthread_dat1(int tid, int& n_presyn, int& n_netcon,
+static int nrnthread_dat1(int tid, int& n_presyn, int& n_netcon,
   int*& output_gid, int*& netcon_srcgid);
 static void write_nrnthread_task(const char*, CellGroup* cgs);
 static int* datum2int(int type, Memb_list* ml, NrnThread& nt, CellGroup& cg, DatumIndices& di, int* ml_vdata_offset);
@@ -166,21 +168,43 @@ static NrnMappingInfo mapinfo;
 // add version string to the dataset files
 const char *bbcore_write_version = "1.2";
 
+static size_t part1();
+static void part2(const char*);
+
 // accessible from ParallelContext.total_bytes()
 size_t nrnbbcore_write() {
   if (!use_cachevec) {
     hoc_execerror("nrnbbcore_write requires cvode.cache_efficient(1)", NULL);
-  }
-  NrnThread* nt;
-  NrnThreadMembList* tml;
-  if (!bbcore_dparam_size) {
-    bbcore_dparam_size = new int[n_memb_func];
   }
   char fname[1024];
   char path[1024];
   sprintf(path, ".");
   if (ifarg(1)) {
     strcpy(path, hoc_gargstr(1));
+  }
+
+  size_t rankbytes = part1(); // can arrange to be just before part2
+
+  sprintf(fname, "%s/%s", path, "byteswap1.dat");
+  write_byteswap1(fname);
+
+  sprintf(fname, "%s/%s", path, "bbcore_mech.dat");
+  write_memb_mech_types(fname);
+
+  sprintf(fname, "%s/%s", path, "globals.dat");
+  write_globals(fname);
+
+  part2(path);
+  return rankbytes;
+}
+
+static size_t part1() {
+  size_t rankbytes = 0;
+  size_t nbytes;
+  NrnThread* nt;
+  NrnThreadMembList* tml;
+  if (!bbcore_dparam_size) {
+    bbcore_dparam_size = new int[n_memb_func];
   }
   for (int i=0; i < n_memb_func; ++i) {
     int sz = nrn_prop_dparam_size_[i];
@@ -194,17 +218,6 @@ size_t nrnbbcore_write() {
   setup_nrn_has_net_event();
   mk_tml_with_art();
 
-  sprintf(fname, "%s/%s", path, "byteswap1.dat");
-  write_byteswap1(fname);
-
-  sprintf(fname, "%s/%s", path, "bbcore_mech.dat");
-  write_memb_mech_types(fname);
-
-  sprintf(fname, "%s/%s", path, "globals.dat");
-  write_globals(fname);
-
-  size_t rankbytes = 0;
-  size_t nbytes;
   FOR_THREADS(nt) {
     size_t threadbytes = 0;
     size_t npnt = 0;
@@ -248,6 +261,12 @@ size_t nrnbbcore_write() {
   CellGroup* cgs = mk_cellgroups();
   cellgroups_ = cgs;
   datumtransform(cgs);
+  return rankbytes;
+}
+
+static void part2(const char* path) {
+  NrnThreadMembList* tml;
+  CellGroup* cgs = cellgroups_;
   for (int i=0; i < nrn_nthread; ++i) {
     chkpnt = 0;
     write_nrnthread(path, nrn_threads[i], cgs[i]);
@@ -298,8 +317,8 @@ size_t nrnbbcore_write() {
     }
     tml_with_art = NULL;
   }
-
-  return rankbytes;
+  delete [] cellgroups_;
+  cellgroups_ = NULL;
 }
 
 int nrncore_art2index(double* d) {
@@ -1022,14 +1041,16 @@ static void nrnbbcore_vecplay_write(FILE* f, NrnThread& nt) {
   }
 }
 
-static void nrnthread_dat1(int tid, int& n_presyn, int& n_netcon,
+static int nrnthread_dat1(int tid, int& n_presyn, int& n_netcon,
   int*& output_gid, int*& netcon_srcgid) {
 
+  if (tid >= nrn_nthread) { return 0; }
   CellGroup& cg = cellgroups_[tid];
   n_presyn = cg.n_presyn;
   n_netcon = cg.n_netcon;
   output_gid = cg.output_gid;  cg.output_gid = NULL;
   netcon_srcgid = cg.netcon_srcgid;  cg.netcon_srcgid = NULL;
+  return 1;
 }
 
 void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
@@ -1486,6 +1507,52 @@ void nrn_write_mapping_info(const char *path, int gid, NrnMappingInfo &minfo) {
         }
     }
     fclose(f);
+}
+
+typedef void*(*CNB)(...);
+typedef struct core2nrn_callback_t {
+  const char* name;
+  CNB f;
+} core2nrn_callback_t;
+
+extern CNB get_partrans_setup_info; // from partrans.cpp
+
+static core2nrn_callback_t cnbs[]  = {
+  {"nrn2core_mkmech_info_", (CNB)write_memb_mech_types_direct},
+  {"nrn2core_get_global_dbl_item_", (CNB)get_global_dbl_item},
+  {"nrn2core_get_global_int_item_", (CNB)get_global_int_item},
+  {"nrn2core_get_partrans_setup_info_", get_partrans_setup_info},
+  {"nrn2core_get_dat1_", (CNB)nrnthread_dat1},
+  {NULL, NULL}
+};
+
+int nrncore_run() {
+  printf("nrncore_run\n");
+  char* corenrn_lib = getenv("CORENEURONLIB");
+  if (!corenrn_lib) {
+    hoc_execerror("nrncore_run needs a CORENEURONLIB environment variable", NULL);
+  }
+  void* handle = dlopen(corenrn_lib, RTLD_NOW|RTLD_GLOBAL);
+  if (!handle) {   
+    hoc_execerror("Could not dlopen NRN_PYLIB: ", corenrn_lib);
+  }
+  for (int i=0; cnbs[i].name; ++i) {
+    void* sym = dlsym(handle, cnbs[i].name);
+    if (!sym) {
+      fprintf(stderr, "Could not get symbol %s in %s\n", cnbs[i].name, corenrn_lib);
+      hoc_execerror("dlsym returned NULL", NULL);
+    }
+    void** c = (void**)sym;
+    *c = (void*)(cnbs[i].f);
+  }
+
+  void* sym = dlsym(handle, "corenrn_embedded_run");
+  if (!sym) {
+    hoc_execerror("Could not get symbol corenrn_embedded_run from", corenrn_lib);
+  }
+  part1();
+  int (*r)() = (int (*)())sym;
+  return r();
 }
 
 } // end of extern "C"
