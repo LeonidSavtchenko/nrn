@@ -137,10 +137,27 @@ static void write_globals(const char* fname);
 static int get_global_int_item(const char* name);
 static void* get_global_dbl_item(void* p, const char* & name, int& size, double*& val);
 static void write_nrnthread(const char* fname, NrnThread& nt, CellGroup& cg);
+
 static int nrnthread_dat1(int tid, int& n_presyn, int& n_netcon,
   int*& output_gid, int*& netcon_srcgid);
+static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int& ndiam,
+  int& nmech, int*& tml_index, int*& ml_nodecount, int& nidata,
+  int& nvdata, int*& ml_vdata_offset, int& nweight);
+static int nrnthread_dat2_2(int tid, int*& v_parent_index, double*& a, double*& b,
+  double*& area, double*& v, double*& diamvec);
+static int nrnthread_dat2_mech(int tid, int type, int v_data_offset, int dsz_inst, int*& nodeindices,
+  double*& data, int*& pdata);
+static int nrnthread_dat2_3(int tid, int nweight, int*& output_vindex, double*& output_threshold,
+  int*& netcon_pnttype, int*& netcon_pntindex, double*& weights, double*& delays);
+static int nrnthread_dat2_corepointer(int tid, int& n);
+static int nrnthread_dat2_corepointer_mech(int tid, int type, Memb_list* ml,
+  int& icnt, int& dcnt, int*& iarray, double*& darray);
+static int nrnthread_dat2_vecplay(int tid, int& n);
+static int nrnthread_dat2_vecplay_inst(int tid, int i, int& vptype, int& mtype,
+  int& ix, int& sz, double*& yvec, double*& tvec);
+
 static void write_nrnthread_task(const char*, CellGroup* cgs);
-static int* datum2int(int type, Memb_list* ml, NrnThread& nt, CellGroup& cg, DatumIndices& di, int* ml_vdata_offset);
+static int* datum2int(int type, Memb_list* ml, NrnThread& nt, CellGroup& cg, DatumIndices& di, int ml_vdata_offset);
 static void setup_nrn_has_net_event();
 static int chkpnt;
 
@@ -980,6 +997,17 @@ static void write_contiguous_art_data(double** data, int nitem, int szitem, FILE
   }
 }
 
+static double* contiguous_art_data(double** data, int nitem, int szitem) {
+  double* d1 = new double[nitem*szitem];
+  int k = 0;
+  for (int i = 0; i < nitem; ++i) {
+    for (int j=0; j < szitem; ++j) {
+      d1[k++] = data[i][j];
+    }
+  }
+  return d1;
+}
+
 // Vector.play information.
 // Must play into a data element in this thread
 // File format is # of play instances in this thread (generally VecPlayContinuous)
@@ -989,10 +1017,14 @@ static void write_contiguous_art_data(double** data, int nitem, int szitem, FILE
 // a discon vector or VecPlayStep with a DT or tvec, but are not implemented
 // at present. Assertion errors are generated if not type 0 of if we
 // cannot determine the index into the NrnThread._data .
-static void nrnbbcore_vecplay_write(FILE* f, NrnThread& nt) {
+
+static int nrnthread_dat2_vecplay(int tid, int& n) {
+  if (tid >= nrn_nthread) { return 0; }
+  NrnThread& nt = nrn_threads[tid];
+
   // count the instances for this thread
   // error if not a VecPlayContinuous with no discon vector
-  int n = 0;
+  n = 0;
   PlayRecList* fp = net_cvode_instance->fixed_play_;
   for (int i=0; i < fp->count(); ++i){
     if (fp->item(i)->type() == VecPlayContinuousType) {
@@ -1009,34 +1041,63 @@ static void nrnbbcore_vecplay_write(FILE* f, NrnThread& nt) {
       assert(0);
     }
   }
-  fprintf(f, "%d VecPlay instances\n", n);
-  for (int i=0; i < fp->count(); ++i) {
+
+  return 1;
+}
+
+static int nrnthread_dat2_vecplay_inst(int tid, int i, int& vptype, int& mtype,
+  int& ix, int& sz, double*& yvec, double*& tvec) {
+
+  if (tid >= nrn_nthread) { return 0; }
+  NrnThread& nt = nrn_threads[tid];
+
+    PlayRecList* fp = net_cvode_instance->fixed_play_;
     if (fp->item(i)->type() == VecPlayContinuousType) {
       VecPlayContinuous* vp = (VecPlayContinuous*)fp->item(i);
       if (vp->discon_indices_ == NULL) {
         if (vp->ith_ == nt.id) {
           double* pd = vp->pd_;
           int found = 0;
-          fprintf(f, "%d\n", vp->type());
+          vptype = vp->type();
           for (NrnThreadMembList* tml = nt.tml; tml; tml = tml->next) {
             if (nrn_is_artificial_[tml->index]) { continue; }
             Memb_list* ml = tml->ml;
             int nn = nrn_prop_param_size_[tml->index] * ml->nodecount;
             if (pd >= ml->data[0] && pd < (ml->data[0] + nn)) {
-              int ix = (pd - ml->data[0]);
-              int sz = vector_capacity(vp->y_);
-              fprintf(f, "%d\n", tml->index);
-              fprintf(f, "%d\n", ix);
-              fprintf(f, "%d\n", sz);
-              writedbl(vector_vec(vp->y_), sz);
-              writedbl(vector_vec(vp->t_), sz);
+              mtype = tml->index;
+              ix = (pd - ml->data[0]);
+              sz = vector_capacity(vp->y_);
+              yvec = vector_vec(vp->y_);
+              tvec = vector_vec(vp->t_);
               found = 1;
               break;
             }
           }
           assert(found);
+          return 1;
         }
       }
+    }
+
+  return 0;
+}
+
+static void nrnbbcore_vecplay_write(FILE* f, NrnThread& nt) {
+  // count the instances for this thread
+  // error if not a VecPlayContinuous with no discon vector
+  int n;
+  nrnthread_dat2_vecplay(nt.id, n);
+  fprintf(f, "%d VecPlay instances\n", n);
+  PlayRecList* fp = net_cvode_instance->fixed_play_;
+  for (int i=0; i < fp->count(); ++i) {
+    int vptype, mtype, ix, sz; double *yvec, *tvec;
+    if (nrnthread_dat2_vecplay_inst(nt.id, i, vptype, mtype, ix, sz, yvec, tvec)) {
+      fprintf(f, "%d\n", vptype);
+      fprintf(f, "%d\n", mtype);
+      fprintf(f, "%d\n", ix);
+      fprintf(f, "%d\n", sz);
+      writedbl(yvec, sz);
+      writedbl(tvec, sz);
     }
   }
 }
@@ -1053,45 +1114,67 @@ static int nrnthread_dat1(int tid, int& n_presyn, int& n_netcon,
   return 1;
 }
 
-void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
-  char fname[1000];
-  if (cg.n_output <= 0) { return; }
-  assert(cg.group_id >= 0);
-  sprintf(fname, "%s/%d_1.dat", path, cg.group_id);
-  FILE* f = fopen(fname, "wb");
-  if (!f) {
-    hoc_execerror("nrnbbcore_write write_nrnthread could not open for writing:", fname);
-  }
-  fprintf(f, "%s\n", bbcore_write_version);
-  fprintf(f, "%d npresyn\n", cg.n_presyn);
-  fprintf(f, "%d nnetcon\n", cg.n_netcon);
-  writeint(cg.output_gid, cg.n_presyn);
-  writeint(cg.netcon_srcgid, cg.n_netcon);
-  if (cg.output_gid) {delete [] cg.output_gid; cg.output_gid = NULL; }
-  if (cg.netcon_srcgid) {delete [] cg.netcon_srcgid; cg.netcon_srcgid = NULL; }
-  fclose(f);
+// sizes and total data count
+static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int& ndiam,
+  int& nmech, int*& tml_index, int*& ml_nodecount, int& nidata,
+  int& nvdata, int*& ml_vdata_offset, int& nweight) {
+  
+  if (tid >= nrn_nthread) { return 0; }
+  CellGroup& cg = cellgroups_[tid];
+  NrnThread& nt = nrn_threads[tid];
 
-  sprintf(fname, "%s/%d_2.dat", path, cg.group_id);
-  f = fopen(fname, "w");
-  if (!f) {
-    hoc_execerror("nrnbbcore_write write_nrnthread could not open for writing:", fname);
-  }
+  ngid = cg.n_output;
+  n_real_gid = cg.n_real_output;
+  nnode = nt.end;
+  ndiam = cg.ndiam;
+  nmech = cg.n_mech;
 
-  fprintf(f, "%s\n", bbcore_write_version);
+
   NrnThreadMembList* tml;
-  // sizes and total data count
-  int* ml_vdata_offset = new int[n_memb_func];
+  ml_vdata_offset = new int[n_memb_func];
   int vdata_offset = 0;
-  for (int i=0; i < n_memb_func; ++i) {
+  int i;
+  for (i=0; i < n_memb_func; ++i) {
     ml_vdata_offset[i] = -1; // for nt._vdata
   }
-  fprintf(f, "%d ngid\n", cg.n_output);
-  fprintf(f, "%d n_real_gid\n", cg.n_real_output);
-  fprintf(f, "%d nnode\n", nt.end);
-  fprintf(f, "%d ndiam\n", cg.ndiam);
-  fprintf(f, "%d nmech\n", cg.n_mech);
+  tml_index = new int[nmech];
+  ml_nodecount = new int[nmech];
+  for (i=0, tml=tml_with_art[nt.id]; tml; tml = tml->next, ++i) {
+    tml_index[i] = tml->index;
+    ml_nodecount[i] = tml->ml->nodecount;
+    ml_vdata_offset[tml->index] = vdata_offset;
+    int* ds = memb_func[tml->index].dparam_semantics;
+    for (int psz=0; psz < bbcore_dparam_size[tml->index]; ++psz) {
+      if (ds[psz] == -4 || ds[psz] == -6 || ds[psz] == -7 || ds[psz] == 0) {
+        //printf("%s ds[%d]=%d vdata_offset=%d\n", memb_func[tml->index].sym->name, psz, ds[psz], vdata_offset);
+        vdata_offset += tml->ml->nodecount;
+      }
+    }
+  }
+  nvdata = vdata_offset;
+  //  printf("nidata=%d nvdata=%d nnetcon=%d\n", 0, nvdata, cg.n_netcon);
+  for (i=0; i < cg.n_netcon; ++i) {
+    nweight += cg.netcons[i]->cnt_;
+  }
 
-  double* diamvec = NULL;
+  return 1;
+}
+
+static int nrnthread_dat2_2(int tid, int*& v_parent_index, double*& a, double*& b,
+  double*& area, double*& v, double*& diamvec) {
+
+  if (tid >= nrn_nthread) { return 0; }
+  CellGroup& cg = cellgroups_[tid];
+  NrnThread& nt = nrn_threads[tid];
+
+  assert(cg.n_real_output == nt.ncell);
+
+  v_parent_index = nt._v_parent_index;
+  a = nt._actual_a;
+  b = nt._actual_b;
+  area = nt._actual_area;
+  v = nt._actual_v;
+  diamvec = NULL;
   if (cg.ndiam) {
     diamvec = new double[nt.end];
     for (int i=0; i < nt.end; ++i) {
@@ -1106,74 +1189,57 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
       diamvec[i] = diam;
     }
   }
+  return 1;
+}
 
-  for (tml=tml_with_art[nt.id]; tml; tml = tml->next) {
-    fprintf(f, "%d\n", tml->index);
-    fprintf(f, "%d\n", tml->ml->nodecount);
-    ml_vdata_offset[tml->index] = vdata_offset;
-    int* ds = memb_func[tml->index].dparam_semantics;
-    for (int psz=0; psz < bbcore_dparam_size[tml->index]; ++psz) {
-      if (ds[psz] == -4 || ds[psz] == -6 || ds[psz] == -7 || ds[psz] == 0) {
-        //printf("%s ds[%d]=%d vdata_offset=%d\n", memb_func[tml->index].sym->name, psz, ds[psz], vdata_offset);
-        vdata_offset += tml->ml->nodecount;
-      }
-    }
-  }
-  //  printf("nidata=%d nvdata=%d nnetcon=%d\n", 0, vdata_offset, cg.n_netcon);
-  fprintf(f, "%d nidata\n", 0);
-  fprintf(f, "%d nvdata\n", vdata_offset);
-  int nweight = 0;
-  for (int i=0; i < cg.n_netcon; ++i) {
-    nweight += cg.netcons[i]->cnt_;
-  }
-  fprintf(f, "%d nweight\n", nweight);
-  // data
-  assert(cg.n_real_output == nt.ncell);
-  writeint(nt._v_parent_index, nt.end);
-  writedbl(nt._actual_a, nt.end);
-  writedbl(nt._actual_b, nt.end);
-  writedbl(nt._actual_area, nt.end);
-  writedbl(nt._actual_v, nt.end);
-  if (diamvec) {
-    writedbl(diamvec, nt.end);
-    delete [] diamvec;
-  }
-  int id = 0;
-  for (tml=tml_with_art[nt.id]; tml; tml=tml->next) {
-    Memb_list* ml = tml->ml;
-    int isart = nrn_is_artificial_[tml->index];
+static int nrnthread_dat2_mech(int tid, int type, int vdata_offset, int dsz_inst, int*& nodeindices,
+  double*& data, int*& pdata) {
+
+  if (tid >= nrn_nthread) { return 0; }
+  CellGroup& cg = cellgroups_[tid];
+  NrnThread& nt = nrn_threads[tid];
+
+    Memb_list* ml = memb_list + type;
+    int isart = nrn_is_artificial_[type];
     int n = ml->nodecount;
-    int sz = nrn_prop_param_size_[tml->index];
+    int sz = nrn_prop_param_size_[type];
     if (isart) { // data may not be contiguous
-      write_contiguous_art_data(ml->data, n, sz, f);
+      data = contiguous_art_data(ml->data, n, sz); // delete after use
     }else{
-      writeint(ml->nodeindices, n);
-      writedbl(ml->data[0], n * sz);
+      nodeindices = ml->nodeindices;
+      data = ml->data[0]; // do not delete after use
     }
-    sz = bbcore_dparam_size[tml->index];
 
+    sz = bbcore_dparam_size[type]; // nrn_prop_dparam_size off by 1 if cvode_ieq.
     if (sz) {
-      int* pdata = datum2int(tml->index, ml, nt, cg, cg.datumindices[id], ml_vdata_offset);
-      writeint(pdata, n * sz);
-      ++id;
-      delete [] pdata;
+      pdata = datum2int(type, ml, nt, cg, cg.datumindices[dsz_inst], vdata_offset);
+    }else{
+      pdata = NULL;
     }
-  }
-  writeint(cg.output_vindex, cg.n_presyn);
-  double* output_threshold = new double[cg.n_real_output];
+
+    return 1;
+}
+
+static int nrnthread_dat2_3(int tid, int nweight, int*& output_vindex, double*& output_threshold,
+  int*& netcon_pnttype, int*& netcon_pntindex, double*& weights, double*& delays) {
+
+  if (tid >= nrn_nthread) { return 0; }
+  CellGroup& cg = cellgroups_[tid];
+  NrnThread& nt = nrn_threads[tid];
+
+  output_vindex = cg.output_vindex;
+  output_threshold = new double[cg.n_real_output];
   for (int i=0; i < cg.n_real_output; ++i) {
     output_threshold[i] = cg.output_ps[i] ? cg.output_ps[i]->threshold_ : 0.0;
   }
-  writedbl(output_threshold, cg.n_real_output);
-  delete [] output_threshold;
 
   // connections
   int n = cg.n_netcon;
-//printf("n_netcon=%d nweight=%d\n", n, nweight);
-  writeint(cg.netcon_pnttype, n);
-  writeint(cg.netcon_pntindex, n);
+  //printf("n_netcon=%d nweight=%d\n", n, nweight);
+  netcon_pnttype = cg.netcon_pnttype;
+  netcon_pntindex = cg.netcon_pntindex;
   // alloc a weight array and write netcon weights
-  double* weights = new double[nweight];
+  weights = new double[nweight];
   int iw = 0;
   for (int i=0; i < n; ++ i) {
     NetCon* nc = cg.netcons[i];
@@ -1181,41 +1247,45 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
       weights[iw++] = nc->weight_[j];
     }
   }
-  writedbl(weights, nweight);
-  delete [] weights;
   // alloc a delay array and write netcon delays
-  double* delays = new double[n];
+  delays = new double[n];
   for (int i=0; i < n; ++ i) {
     NetCon* nc = cg.netcons[i];
     delays[i] = nc->delay_;
   }
-  writedbl(delays, n);
-  delete [] delays;
 
-  // special handling for BBCOREPOINTER
-  // how many mechanisms require it
+  return 1;
+}
+
+static int nrnthread_dat2_corepointer(int tid, int& n) {
+
+  if (tid >= nrn_nthread) { return 0; }
+  NrnThread& nt = nrn_threads[tid];
+
   n = 0;
-  for (tml=tml_with_art[nt.id]; tml; tml = tml->next) {
+  for (NrnThreadMembList* tml=tml_with_art[nt.id]; tml; tml = tml->next) {
     if (nrn_bbcore_write_[tml->index]) {
       ++n;
     }
   }
-  fprintf(f, "%d bbcorepointer\n", n);
-  // for each of those, what is the mech type and data size
-  // and what is the data
-  for (tml=tml_with_art[nt.id]; tml; tml = tml->next) {
-    if (nrn_bbcore_write_[tml->index]) {
-      fprintf(f, "%d\n", tml->index);
-      Memb_list* ml = tml->ml;
-      int dcnt = 0;
-      int icnt = 0;
+
+  return 1;
+}
+
+static int nrnthread_dat2_corepointer_mech(int tid, int type, Memb_list* ml,
+ int& icnt, int& dcnt, int*& iArray, double*& dArray) {
+
+  if (tid >= nrn_nthread) { return 0; }
+  NrnThread& nt = nrn_threads[tid];
+
+      dcnt = 0;
+      icnt = 0;
       // data size and allocate
       for (int i = 0; i < ml->nodecount; ++i) {
-        (*nrn_bbcore_write_[tml->index])(NULL, NULL, &dcnt, &icnt, ml->data[i], ml->pdata[i], ml->_thread, &nt);
+        (*nrn_bbcore_write_[type])(NULL, NULL, &dcnt, &icnt, ml->data[i], ml->pdata[i], ml->_thread, &nt);
       }
-      fprintf(f, "%d\n%d\n", icnt, dcnt);
-      double* dArray = NULL;
-      int* iArray = NULL;
+      dArray = NULL;
+      iArray = NULL;
       if (icnt)
       {
         iArray = new int[icnt];
@@ -1227,8 +1297,127 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
       icnt = dcnt = 0;
       // data values
       for (int i = 0; i < ml->nodecount; ++i) {
-        (*nrn_bbcore_write_[tml->index])(dArray, iArray, &dcnt, &icnt, ml->data[i], ml->pdata[i], ml->_thread, &nt);
+        (*nrn_bbcore_write_[type])(dArray, iArray, &dcnt, &icnt, ml->data[i], ml->pdata[i], ml->_thread, &nt);
       }
+
+  return 1;
+}
+
+void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
+  char fname[1000];
+  if (cg.n_output <= 0) { return; }
+  assert(cg.group_id >= 0);
+  sprintf(fname, "%s/%d_1.dat", path, cg.group_id);
+  FILE* f = fopen(fname, "wb");
+  if (!f) {
+    hoc_execerror("nrnbbcore_write write_nrnthread could not open for writing:", fname);
+  }
+  fprintf(f, "%s\n", bbcore_write_version);
+
+  //nrnthread_dat1(int tid, int& n_presyn, int& n_netcon, int*& output_gid, int*& netcon_srcgid);
+  fprintf(f, "%d npresyn\n", cg.n_presyn);
+  fprintf(f, "%d nnetcon\n", cg.n_netcon);
+  writeint(cg.output_gid, cg.n_presyn);
+  writeint(cg.netcon_srcgid, cg.n_netcon);
+
+  if (cg.output_gid) {delete [] cg.output_gid; cg.output_gid = NULL; }
+  if (cg.netcon_srcgid) {delete [] cg.netcon_srcgid; cg.netcon_srcgid = NULL; }
+  fclose(f);
+
+  sprintf(fname, "%s/%d_2.dat", path, cg.group_id);
+  f = fopen(fname, "w");
+  if (!f) {
+    hoc_execerror("nrnbbcore_write write_nrnthread could not open for writing:", fname);
+  }
+
+  fprintf(f, "%s\n", bbcore_write_version);
+
+  // sizes and total data count
+  int ngid, n_real_gid, nnode, ndiam, nmech, *tml_index, *ml_nodecount, nidata,
+    nvdata, *ml_vdata_offset, nweight;
+  nrnthread_dat2_1(nt.id, ngid, n_real_gid, nnode, ndiam,
+    nmech, tml_index, ml_nodecount, nidata,
+    nvdata, ml_vdata_offset, nweight);
+
+  fprintf(f, "%d ngid\n", ngid);
+  fprintf(f, "%d n_real_gid\n", n_real_gid);
+  fprintf(f, "%d nnode\n", nnode);
+  fprintf(f, "%d ndiam\n", ndiam);
+  fprintf(f, "%d nmech\n", nmech);
+  fprintf(f, "%d nidata\n", 0);
+  fprintf(f, "%d nvdata\n", nvdata);
+
+  for (int i=0; i < nmech; ++i) {
+    fprintf(f, "%d\n", tml_index[i]);
+    fprintf(f, "%d\n", ml_nodecount[i]);
+  }
+  fprintf(f, "%d nweight\n", nweight);
+
+  // data
+  int *v_parent_index; double *a, *b, *area, *v, *diamvec;
+  nrnthread_dat2_2(nt.id, v_parent_index, a, b, area, v, diamvec);
+  assert(cg.n_real_output == nt.ncell);
+  writeint(nt._v_parent_index, nt.end);
+  writedbl(nt._actual_a, nt.end);
+  writedbl(nt._actual_b, nt.end);
+  writedbl(nt._actual_area, nt.end);
+  writedbl(nt._actual_v, nt.end);
+  if (cg.ndiam) {
+    writedbl(diamvec, nt.end);
+    delete [] diamvec;
+  }
+
+  // mechanism data
+  int dsz_inst = 0;
+  for (NrnThreadMembList* tml=tml_with_art[nt.id]; tml; tml=tml->next) {
+    int type = tml->index;
+    int *nodeindices, *pdata; double* data;
+    nrnthread_dat2_mech(nt.id, type, ml_vdata_offset[type], dsz_inst, nodeindices, data, pdata);
+    Memb_list* ml = tml->ml;
+    int n = ml->nodecount;
+    int sz = nrn_prop_param_size_[tml->index];
+    writeint(ml->nodeindices, n);
+    writedbl(ml->data[0], n * sz);
+    sz = bbcore_dparam_size[tml->index];
+    if (pdata) {
+      ++dsz_inst;
+      writeint(pdata, n * sz);
+      delete [] pdata;
+    }
+  }
+  delete [] ml_vdata_offset;
+
+  int *output_vindex, *netcon_pnttype, *netcon_pntindex;
+  double *output_threshold, *weights, *delays;
+  nrnthread_dat2_3(nt.id, nweight, output_vindex, output_threshold,
+    netcon_pnttype, netcon_pntindex, weights, delays);
+  writeint(output_vindex, cg.n_presyn);
+  writedbl(output_threshold, cg.n_real_output);
+  delete [] output_threshold;
+
+  // connections
+  int n = cg.n_netcon;
+//printf("n_netcon=%d nweight=%d\n", n, nweight);
+  writeint(netcon_pnttype, n);
+  writeint(netcon_pntindex, n);
+  writedbl(weights, nweight);
+  delete [] weights;
+  writedbl(delays, n);
+  delete [] delays;
+
+  // special handling for BBCOREPOINTER
+  // how many mechanisms require it
+  nrnthread_dat2_corepointer(nt.id, n);
+  fprintf(f, "%d bbcorepointer\n", n);
+  // for each of those, what is the mech type and data size
+  // and what is the data
+  for (NrnThreadMembList* tml=tml_with_art[nt.id]; tml; tml = tml->next) {
+    if (nrn_bbcore_write_[tml->index]) {
+      Memb_list* ml = tml->ml;
+      int icnt, dcnt, *iArray; double* dArray;
+      nrnthread_dat2_corepointer_mech(nt.id, tml->index, ml, icnt, dcnt, iArray, dArray);
+      fprintf(f, "%d\n", tml->index);
+      fprintf(f, "%d\n%d\n", icnt, dcnt);
       if (icnt) {
         writeint(iArray, icnt);
         delete [] iArray;
@@ -1244,7 +1433,6 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
   nrnbbcore_vecplay_write(f, nt);
 
   fclose(f);
-  delete [] ml_vdata_offset;
 }
 
 
@@ -1364,7 +1552,7 @@ void write_nrnthread_task(const char* path, CellGroup* cgs)
 }
 
 
-int* datum2int(int type, Memb_list* ml, NrnThread& nt, CellGroup& cg, DatumIndices& di, int* ml_vdata_offset) {
+int* datum2int(int type, Memb_list* ml, NrnThread& nt, CellGroup& cg, DatumIndices& di, int ml_vdata_offset) {
   int isart = nrn_is_artificial_[di.type];
   int sz = bbcore_dparam_size[type];
   int* pdata = new int[ml->nodecount * sz];
@@ -1390,13 +1578,13 @@ int* datum2int(int type, Memb_list* ml, NrnThread& nt, CellGroup& cg, DatumIndic
       }else if (etype == -2) { // an ion and this is the iontype
         pdata[jj] = eindex;
       }else if (etype == -4) { // netsend (_tqitem)
-        pdata[jj] = ml_vdata_offset[type] + eindex;
+        pdata[jj] = ml_vdata_offset + eindex;
         //printf("etype %d jj=%d eindex=%d pdata=%d\n", etype, jj, eindex, pdata[jj]);
       }else if (etype == -6) { // pntproc
-        pdata[jj] = ml_vdata_offset[type] + eindex;
+        pdata[jj] = ml_vdata_offset + eindex;
         //printf("etype %d jj=%d eindex=%d pdata=%d\n", etype, jj, eindex, pdata[jj]);
       }else if (etype == -7) { // bbcorepointer
-        pdata[jj] = ml_vdata_offset[type] + eindex;
+        pdata[jj] = ml_vdata_offset + eindex;
         //printf("etype %d jj=%d eindex=%d pdata=%d\n", etype, jj, eindex, pdata[jj]);
       }else if (etype == -5) { // POINTER to voltage
         pdata[jj] = eindex;
@@ -1517,12 +1705,21 @@ typedef struct core2nrn_callback_t {
 
 extern CNB get_partrans_setup_info; // from partrans.cpp
 
+
 static core2nrn_callback_t cnbs[]  = {
   {"nrn2core_mkmech_info_", (CNB)write_memb_mech_types_direct},
   {"nrn2core_get_global_dbl_item_", (CNB)get_global_dbl_item},
   {"nrn2core_get_global_int_item_", (CNB)get_global_int_item},
   {"nrn2core_get_partrans_setup_info_", get_partrans_setup_info},
   {"nrn2core_get_dat1_", (CNB)nrnthread_dat1},
+  {"nrn2core_get_dat2_1_", (CNB)nrnthread_dat2_1},
+  {"nrn2core_get_dat2_2_", (CNB)nrnthread_dat2_2},
+  {"nrn2core_get_dat2_mech_", (CNB)nrnthread_dat2_mech},
+  {"nrn2core_get_dat2_3_", (CNB)nrnthread_dat2_3},
+  {"nrn2core_get_dat2_corepointer_", (CNB)nrnthread_dat2_corepointer},
+  {"nrn2core_get_dat2_corepointer_mech_", (CNB)nrnthread_dat2_corepointer_mech},
+  {"nrn2core_get_dat2_vecplay_", (CNB)nrnthread_dat2_vecplay},
+  {"nrn2core_get_dat2_vecplay_inst_", (CNB)nrnthread_dat2_vecplay_inst},
   {NULL, NULL}
 };
 
