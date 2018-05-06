@@ -145,12 +145,12 @@ static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int
   int& nvdata, int*& ml_vdata_offset, int& nweight);
 static int nrnthread_dat2_2(int tid, int*& v_parent_index, double*& a, double*& b,
   double*& area, double*& v, double*& diamvec);
-static int nrnthread_dat2_mech(int tid, int type, int v_data_offset, int dsz_inst, int*& nodeindices,
+static int nrnthread_dat2_mech(int tid, size_t i, int v_data_offset, int dsz_inst, int*& nodeindices,
   double*& data, int*& pdata);
 static int nrnthread_dat2_3(int tid, int nweight, int*& output_vindex, double*& output_threshold,
   int*& netcon_pnttype, int*& netcon_pntindex, double*& weights, double*& delays);
 static int nrnthread_dat2_corepointer(int tid, int& n);
-static int nrnthread_dat2_corepointer_mech(int tid, int type, Memb_list* ml,
+static int nrnthread_dat2_corepointer_mech(int tid, size_t i,
   int& icnt, int& dcnt, int*& iarray, double*& darray);
 static int nrnthread_dat2_vecplay(int tid, int& n);
 static int nrnthread_dat2_vecplay_inst(int tid, int i, int& vptype, int& mtype,
@@ -171,8 +171,7 @@ static int chkpnt;
 // so we assume there will be no POINTER usage into that data.
 // Also, note that ml.nodecount for artificial cell does not refer to
 // a list of voltage nodes but just to the count of instances.
-static NrnThreadMembList** tml_with_art; // nrn_nthread of them
-static void mk_tml_with_art(void);
+static void mk_tml_with_art(void); // set up MlWithArt CellGroup.mlwithart
 
 declareNrnHash(PVoid2Int, void*, int)
 implementNrnHash(PVoid2Int, void*, int)
@@ -233,6 +232,7 @@ static size_t part1() {
     }
   }
   setup_nrn_has_net_event();
+  cellgroups_ = new CellGroup[nrn_nthread]; // here because following needs mlwithart
   mk_tml_with_art();
 
   FOR_THREADS(nt) {
@@ -248,18 +248,20 @@ static size_t part1() {
 
     int mechcnt = 0;
     size_t mechcnt_instances = 0;
-    for (tml = tml_with_art[ith]; tml; tml = tml->next) {
+    MlWithArt& mla = cellgroups_[ith].mlwithart;
+    for (size_t i = 0; i < mla.size(); ++i) {
+      int type = mla[i].first;
+      Memb_list* ml = mla[i].second;
       ++mechcnt;
-      Memb_list* ml = tml->ml;
       mechcnt_instances += ml->nodecount;
-      npnt += (memb_func[tml->index].is_point ? ml->nodecount : 0);
-      int psize = nrn_prop_param_size_[tml->index];
-      int dpsize = nrn_prop_dparam_size_[tml->index]; // includes cvodeieq if present
-      //printf("%d %s ispnt %d  cnt %d  psize %d  dpsize %d\n",tml->index, memb_func[tml->index].sym->name,
-      //memb_func[tml->index].is_point, ml->nodecount, psize, dpsize);
+      npnt += (memb_func[type].is_point ? ml->nodecount : 0);
+      int psize = nrn_prop_param_size_[type];
+      int dpsize = nrn_prop_dparam_size_[type]; // includes cvodeieq if present
+      //printf("%d %s ispnt %d  cnt %d  psize %d  dpsize %d\n",tml->index, memb_func[type].sym->name,
+      //memb_func[type].is_point, ml->nodecount, psize, dpsize);
       // nodeindices, data, pdata + pnt with prop
-      int notart = nrn_is_artificial_[tml->index] ? 0 : 1;
-      if (nrn_is_artificial_[tml->index]) {
+      int notart = nrn_is_artificial_[type] ? 0 : 1;
+      if (nrn_is_artificial_[type]) {
         nart += ml->nodecount;
       }
       nbytes = ml->nodecount * (notart*sizeof(int) + 1*sizeof(double*) +
@@ -276,13 +278,11 @@ static size_t part1() {
   rankbytes += nrncore_netpar_bytes();
   //printf("%d bytes %ld\n", nrnmpi_myid, rankbytes);
   CellGroup* cgs = mk_cellgroups();
-  cellgroups_ = cgs;
   datumtransform(cgs);
   return rankbytes;
 }
 
 static void part2(const char* path) {
-  NrnThreadMembList* tml;
   CellGroup* cgs = cellgroups_;
   for (int i=0; i < nrn_nthread; ++i) {
     chkpnt = 0;
@@ -324,15 +324,18 @@ static void part2(const char* path) {
     write_nrnthread_task(path, cgs);
   }
 
-  if (tml_with_art) {
-    for (int ith=0; ith < nrn_nthread; ++ith) {
-      NrnThreadMembList* tmlnext;
-      for (tml = tml_with_art[ith]; tml; tml = tmlnext) {
-        tmlnext = tml->next;
-        delete tml;
+  // clean up the art Memb_list of CellGroup[].mlwithart
+  for (int ith=0; ith < nrn_nthread; ++ith) {
+    MlWithArt& mla = cgs[ith].mlwithart;
+    for (size_t i = 0; i < mla.size(); ++i) {
+      int type = mla[i].first;
+      Memb_list* ml = mla[i].second;
+      if (nrn_is_artificial_[type]) {
+        delete [] ml->data;
+        delete [] ml->pdata;
+        delete ml;
       }
     }
-    tml_with_art = NULL;
   }
   delete [] cellgroups_;
   cellgroups_ = NULL;
@@ -369,25 +372,16 @@ static int nrn_has_net_event(int type) {
 void mk_tml_with_art() {
   // copy NrnThread tml list and append ARTIFICIAL cell types 
   // but do not include PatternStim
-  tml_with_art = new NrnThreadMembList*[nrn_nthread];
+  // Now using cgs[tid].mlwithart instead of
+  // tml_with_art = new NrnThreadMembList*[nrn_nthread];
+  // to allow fast retrieval of type and Memb_list* given index into the vector.
+  CellGroup* cgs = cellgroups_;
   // copy from NrnThread
-  NrnThreadMembList *tml1, *tml2;
-  NrnThreadMembList** tail = new NrnThreadMembList*[nrn_nthread];
   for (int id = 0; id < nrn_nthread; ++id) {
-    tml2 = tml_with_art[id] = NULL;
-    for (tml1 = nrn_threads[id].tml; tml1; tml1 = tml1->next) {
-      if (tml_with_art[id] == NULL) {
-        tml2 = new NrnThreadMembList;
-        tml_with_art[id] = tml2;
-      }else{
-        tml2->next = new NrnThreadMembList;
-        tml2 = tml2->next;
-      }
-      tml2->index = tml1->index;
-      tml2->ml = tml1->ml;
-      tml2->next = NULL;
+    MlWithArt& mla = cgs[id].mlwithart;
+    for (NrnThreadMembList* tml = nrn_threads[id].tml; tml; tml = tml->next) {
+      mla.push_back(MlWithArtItem(tml->index, tml->ml));
     }
-    tail[id] = tml2;
   }
   int *acnt = new int[nrn_nthread];
   artdata2index_ = new PVoid2Int(1000);
@@ -409,24 +403,16 @@ void mk_tml_with_art() {
       // allocate
       for (int id = 0; id < nrn_nthread; ++id) {
         if (acnt[id]) {
-          NrnThreadMembList* tml3 = new NrnThreadMembList;
-          tml3->next = NULL;
-          tml3->index = i;
-          tml3->ml = new Memb_list;
-          tml3->ml->nodecount = acnt[id];
-          tml3->ml->nodelist = NULL;
-          tml3->ml->nodeindices = NULL;
-          tml3->ml->prop = NULL;
-          tml3->ml->_thread = NULL;
-          tml3->ml->data = new double*[acnt[id]];
-          tml3->ml->pdata = new Datum*[acnt[id]];
-          // link at tail
-          if (tml_with_art[id] == NULL) {
-            tml_with_art[id] = tail[id] = tml3;
-          }else{
-            tail[id]->next = tml3;
-            tail[id] = tml3;
-          }
+          MlWithArt& mla = cgs[id].mlwithart;
+          ml = new Memb_list;
+          mla.push_back(MlWithArtItem(i, ml)); // need to delete ml when mla destroyed.
+          ml->nodecount = acnt[id];
+          ml->nodelist = NULL;
+          ml->nodeindices = NULL;
+          ml->prop = NULL;
+          ml->_thread = NULL;
+          ml->data = new double*[acnt[id]];
+          ml->pdata = new Datum*[acnt[id]];
         }
       }
       // fill data and pdata pointers
@@ -435,8 +421,7 @@ void mk_tml_with_art() {
       for (int j = 0; j < memb_list[i].nodecount; ++j) {
         Point_process* pnt = (Point_process*)memb_list[i].pdata[j][1]._pvoid;
         int id = ((NrnThread*)pnt->_vnt)->id;
-        assert(tail[id]->index == i);
-        Memb_list* ml = tail[id]->ml;
+        Memb_list* ml = cgs[id].mlwithart.back().second;
         ml->data[acnt[id]] = memb_list[i].data[j];
         ml->pdata[acnt[id]] = memb_list[i].pdata[j];
         artdata2index_->insert(ml->data[acnt[id]], acnt[id]);
@@ -444,7 +429,6 @@ void mk_tml_with_art() {
       }
     }
   }
-  delete [] tail;
   delete [] acnt;
 }
 
@@ -584,14 +568,17 @@ static void mk_cgs_netcon_info(CellGroup* cgs) {
 }
 
 CellGroup* mk_cellgroups() {
-  CellGroup* cgs = new CellGroup[nrn_nthread];
+  CellGroup* cgs = cellgroups_;
   for (int i=0; i < nrn_nthread; ++i) {
     int ncell = nrn_threads[i].ncell; // real cell count
     int npre = ncell;
-    for (NrnThreadMembList* tml = tml_with_art[i]; tml; tml = tml->next) {
-      cgs[i].type2ml[tml->index] = tml->ml;
-      if (nrn_has_net_event(tml->index)) {
-        npre += tml->ml->nodecount;
+    MlWithArt& mla = cgs[i].mlwithart;
+    for (size_t j = 0; j < mla.size(); ++j) {
+      int type = mla[j].first;
+      Memb_list* ml = mla[j].second;
+      cgs[i].type2ml[type] = ml;
+      if (nrn_has_net_event(type)) {
+        npre += ml->nodecount;
       }
     }
     cgs[i].n_presyn = npre;
@@ -611,23 +598,24 @@ CellGroup* mk_cellgroups() {
     // fill in the artcell info
     npre = ncell;
     cgs[i].n_output = ncell; // add artcell (and PP with net_event) with gid in following loop
-    for (NrnThreadMembList* tml = tml_with_art[i]; tml; tml = tml->next) {
-      if (nrn_has_net_event(tml->index)) {
-        for (int j=0; j < tml->ml->nodecount; ++j) {
-          Point_process* pnt = (Point_process*)tml->ml->pdata[j][1]._pvoid;
+    for (size_t j = 0; j < mla.size(); ++j) {
+      int type = mla[j].first;
+      Memb_list* ml = mla[j].second;
+      if (nrn_has_net_event(type)) {
+        for (int j=0; j < ml->nodecount; ++j) {
+          Point_process* pnt = (Point_process*)ml->pdata[j][1]._pvoid;
           PreSyn* ps = (PreSyn*)pnt->presyn_;
           cgs[i].output_ps[npre] = ps;
           int agid = -1;
-          if (nrn_is_artificial_[tml->index]) {
-            agid = -(tml->index + 1000*nrncore_art2index(pnt->prop->param));
+          if (nrn_is_artificial_[type]) {
+            agid = -(type + 1000*nrncore_art2index(pnt->prop->param));
           }else{ // POINT_PROCESS with net_event
-            Memb_list* ml = tml->ml;
-            int sz = nrn_prop_param_size_[tml->index];
+            int sz = nrn_prop_param_size_[type];
             double* d1 = ml->data[0];
             double* d2 = pnt->prop->param;
             assert(d2 >= d1 && d2 < (d1 + (sz*ml->nodecount)));
             int ix = (d2 - d1)/sz;
-            agid = -(tml->index + 1000*ix);
+            agid = -(type + 1000*ix);
           }
           if (ps) {
             if (ps->output_index_ >= 0) { // has gid
@@ -674,21 +662,24 @@ void datumtransform(CellGroup* cgs) {
     NrnThread& nt = nrn_threads[ith];
     CellGroup& cg = cgs[ith];
     // how many mechanisms in use and how many DatumIndices do we need.
-    for (NrnThreadMembList* tml = tml_with_art[ith]; tml; tml = tml->next) {
+    MlWithArt& mla = cgs[ith].mlwithart;
+    for (size_t j = 0; j < mla.size(); ++j) {
+      Memb_list* ml = mla[j].second;
       ++cg.n_mech;
-      if (tml->ml->pdata[0]) {
+      if (ml->pdata[0]) {
         ++cg.ntype;
       }
     }
     cg.datumindices = new DatumIndices[cg.ntype];
     // specify type, allocate the space, and fill the indices
     int i=0;
-    for (NrnThreadMembList* tml = tml_with_art[ith]; tml; tml = tml->next) {
-      int sz = bbcore_dparam_size[tml->index];
+    for (size_t j = 0; j < mla.size(); ++j) {
+      int type = mla[j].first;
+      Memb_list* ml = mla[j].second;
+      int sz = bbcore_dparam_size[type];
       if (sz) {
         DatumIndices& di = cg.datumindices[i++];
-        di.type = tml->index;
-        Memb_list* ml = tml->ml;
+        di.type = type;
         int n = ml->nodecount * sz;
         di.ion_type = new int[n];
         di.ion_index = new int[n];
@@ -1129,8 +1120,6 @@ static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int
   ndiam = cg.ndiam;
   nmech = cg.n_mech;
 
-
-  NrnThreadMembList* tml;
   ml_vdata_offset = new int[n_memb_func];
   int vdata_offset = 0;
   int i;
@@ -1139,15 +1128,18 @@ static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int
   }
   tml_index = new int[nmech];
   ml_nodecount = new int[nmech];
-  for (i=0, tml=tml_with_art[nt.id]; tml; tml = tml->next, ++i) {
-    tml_index[i] = tml->index;
-    ml_nodecount[i] = tml->ml->nodecount;
-    ml_vdata_offset[tml->index] = vdata_offset;
-    int* ds = memb_func[tml->index].dparam_semantics;
-    for (int psz=0; psz < bbcore_dparam_size[tml->index]; ++psz) {
+  MlWithArt& mla = cg.mlwithart;
+  for (size_t j = 0; j < mla.size(); ++j) {
+    int type = mla[j].first;
+    Memb_list* ml = mla[j].second;
+    tml_index[j] = type;
+    ml_nodecount[j] = ml->nodecount;
+    ml_vdata_offset[type] = vdata_offset;
+    int* ds = memb_func[type].dparam_semantics;
+    for (int psz=0; psz < bbcore_dparam_size[type]; ++psz) {
       if (ds[psz] == -4 || ds[psz] == -6 || ds[psz] == -7 || ds[psz] == 0) {
-        //printf("%s ds[%d]=%d vdata_offset=%d\n", memb_func[tml->index].sym->name, psz, ds[psz], vdata_offset);
-        vdata_offset += tml->ml->nodecount;
+        //printf("%s ds[%d]=%d vdata_offset=%d\n", memb_func[type].sym->name, psz, ds[psz], vdata_offset);
+        vdata_offset += ml->nodecount;
       }
     }
   }
@@ -1192,19 +1184,22 @@ static int nrnthread_dat2_2(int tid, int*& v_parent_index, double*& a, double*& 
   return 1;
 }
 
-static int nrnthread_dat2_mech(int tid, int type, int vdata_offset, int dsz_inst, int*& nodeindices,
+static int nrnthread_dat2_mech(int tid, size_t i, int vdata_offset, int dsz_inst, int*& nodeindices,
   double*& data, int*& pdata) {
 
   if (tid >= nrn_nthread) { return 0; }
   CellGroup& cg = cellgroups_[tid];
   NrnThread& nt = nrn_threads[tid];
+  MlWithArtItem& mlai = cg.mlwithart[i];
+  int type = mlai.first;
+  Memb_list* ml = mlai.second;
 
-    Memb_list* ml = memb_list + type;
     int isart = nrn_is_artificial_[type];
     int n = ml->nodecount;
     int sz = nrn_prop_param_size_[type];
     if (isart) { // data may not be contiguous
       data = contiguous_art_data(ml->data, n, sz); // delete after use
+      nodeindices = NULL;
     }else{
       nodeindices = ml->nodeindices;
       data = ml->data[0]; // do not delete after use
@@ -1263,8 +1258,9 @@ static int nrnthread_dat2_corepointer(int tid, int& n) {
   NrnThread& nt = nrn_threads[tid];
 
   n = 0;
-  for (NrnThreadMembList* tml=tml_with_art[nt.id]; tml; tml = tml->next) {
-    if (nrn_bbcore_write_[tml->index]) {
+  MlWithArt& mla = cellgroups_[tid].mlwithart;
+  for (size_t i = 0; i < mla.size(); ++i) {
+    if (nrn_bbcore_write_[mla[i].first]) {
       ++n;
     }
   }
@@ -1272,11 +1268,14 @@ static int nrnthread_dat2_corepointer(int tid, int& n) {
   return 1;
 }
 
-static int nrnthread_dat2_corepointer_mech(int tid, int type, Memb_list* ml,
+static int nrnthread_dat2_corepointer_mech(int tid, size_t i,
  int& icnt, int& dcnt, int*& iArray, double*& dArray) {
 
   if (tid >= nrn_nthread) { return 0; }
   NrnThread& nt = nrn_threads[tid];
+  MlWithArtItem& mlai = cellgroups_[tid].mlwithart[i];
+  int type = mlai.first;
+  Memb_list* ml = mlai.second;
 
       dcnt = 0;
       icnt = 0;
@@ -1344,13 +1343,14 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
   fprintf(f, "%d nnode\n", nnode);
   fprintf(f, "%d ndiam\n", ndiam);
   fprintf(f, "%d nmech\n", nmech);
-  fprintf(f, "%d nidata\n", 0);
-  fprintf(f, "%d nvdata\n", nvdata);
 
   for (int i=0; i < nmech; ++i) {
     fprintf(f, "%d\n", tml_index[i]);
     fprintf(f, "%d\n", ml_nodecount[i]);
   }
+
+  fprintf(f, "%d nidata\n", 0);
+  fprintf(f, "%d nvdata\n", nvdata);
   fprintf(f, "%d nweight\n", nweight);
 
   // data
@@ -1369,16 +1369,22 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
 
   // mechanism data
   int dsz_inst = 0;
-  for (NrnThreadMembList* tml=tml_with_art[nt.id]; tml; tml=tml->next) {
-    int type = tml->index;
+  MlWithArt& mla = cg.mlwithart;
+  for (size_t i = 0; i < mla.size(); ++i) {
+    int type = mla[i].first;
     int *nodeindices, *pdata; double* data;
-    nrnthread_dat2_mech(nt.id, type, ml_vdata_offset[type], dsz_inst, nodeindices, data, pdata);
-    Memb_list* ml = tml->ml;
+    nrnthread_dat2_mech(nt.id, i, ml_vdata_offset[type], dsz_inst, nodeindices, data, pdata);
+    Memb_list* ml = mla[i].second;
     int n = ml->nodecount;
-    int sz = nrn_prop_param_size_[tml->index];
-    writeint(ml->nodeindices, n);
-    writedbl(ml->data[0], n * sz);
-    sz = bbcore_dparam_size[tml->index];
+    int sz = nrn_prop_param_size_[type];
+    if (nodeindices) {
+      writeint(nodeindices, n);
+    }
+    writedbl(data, n * sz);
+    if (nrn_is_artificial_[type]) {
+      delete [] data;
+    }
+    sz = bbcore_dparam_size[type];
     if (pdata) {
       ++dsz_inst;
       writeint(pdata, n * sz);
@@ -1411,12 +1417,12 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
   fprintf(f, "%d bbcorepointer\n", n);
   // for each of those, what is the mech type and data size
   // and what is the data
-  for (NrnThreadMembList* tml=tml_with_art[nt.id]; tml; tml = tml->next) {
-    if (nrn_bbcore_write_[tml->index]) {
-      Memb_list* ml = tml->ml;
+  for (size_t i = 0; i < mla.size(); ++i) {
+    int type = mla[i].first;
+    if (nrn_bbcore_write_[type]) {
       int icnt, dcnt, *iArray; double* dArray;
-      nrnthread_dat2_corepointer_mech(nt.id, tml->index, ml, icnt, dcnt, iArray, dArray);
-      fprintf(f, "%d\n", tml->index);
+      nrnthread_dat2_corepointer_mech(nt.id, i, icnt, dcnt, iArray, dArray);
+      fprintf(f, "%d\n", type);
       fprintf(f, "%d\n%d\n", icnt, dcnt);
       if (icnt) {
         writeint(iArray, icnt);

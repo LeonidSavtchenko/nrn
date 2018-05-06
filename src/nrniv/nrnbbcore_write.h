@@ -23,6 +23,11 @@ public:
   int* ion_index; // or index into _actual_area
 };
 
+//vector version of former NrnThreadMembList copy of NrnThread list of
+// tml + artificial for easy access to ith type and Memb_list*
+typedef std::pair < int, Memb_list* > MlWithArtItem;
+typedef std::vector < MlWithArtItem > MlWithArt;
+
 class CellGroup {
 public:
   CellGroup();
@@ -48,6 +53,7 @@ public:
   // Datum.pval info
   int ntype;
   DatumIndices* datumindices;
+  MlWithArt mlwithart;
 };
 
 // returns start pointer of the container's data
