@@ -40,6 +40,7 @@ public:
   int n_real_output;
   int ndiam; // > 0 only if diam semantics in use.
   int n_mech;
+  int* ml_vdata_offset;
   // following three are parallel arrays
   PreSyn** output_ps; //n_presyn of these, real are first, tml order for acell.
   int* output_gid; // n_presyn of these, -(type + 1000*index) if no gid

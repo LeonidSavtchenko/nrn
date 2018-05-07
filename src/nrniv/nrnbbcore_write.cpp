@@ -142,15 +142,15 @@ static int nrnthread_dat1(int tid, int& n_presyn, int& n_netcon,
   int*& output_gid, int*& netcon_srcgid);
 static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int& ndiam,
   int& nmech, int*& tml_index, int*& ml_nodecount, int& nidata,
-  int& nvdata, int*& ml_vdata_offset, int& nweight);
+  int& nvdata, int& nweight);
 static int nrnthread_dat2_2(int tid, int*& v_parent_index, double*& a, double*& b,
   double*& area, double*& v, double*& diamvec);
-static int nrnthread_dat2_mech(int tid, size_t i, int v_data_offset, int dsz_inst, int*& nodeindices,
+static int nrnthread_dat2_mech(int tid, size_t i, int dsz_inst, int*& nodeindices,
   double*& data, int*& pdata);
 static int nrnthread_dat2_3(int tid, int nweight, int*& output_vindex, double*& output_threshold,
   int*& netcon_pnttype, int*& netcon_pntindex, double*& weights, double*& delays);
 static int nrnthread_dat2_corepointer(int tid, int& n);
-static int nrnthread_dat2_corepointer_mech(int tid, size_t i,
+static int nrnthread_dat2_corepointer_mech(int tid, int type,
   int& icnt, int& dcnt, int*& iarray, double*& darray);
 static int nrnthread_dat2_vecplay(int tid, int& n);
 static int nrnthread_dat2_vecplay_inst(int tid, int i, int& vptype, int& mtype,
@@ -444,6 +444,7 @@ CellGroup::CellGroup() {
   for (int i=0; i < n_memb_func; ++i) {
     type2ml[i] = 0;
   }
+  ml_vdata_offset = NULL;
 }
 
 CellGroup::~CellGroup() {
@@ -455,6 +456,7 @@ CellGroup::~CellGroup() {
   if (datumindices) delete [] datumindices;
   if (netcons) delete [] netcons;
   if (output_ps) delete [] output_ps;
+  if (ml_vdata_offset) delete [] ml_vdata_offset;
   delete [] type2ml;
 }
 
@@ -1107,8 +1109,7 @@ static int nrnthread_dat1(int tid, int& n_presyn, int& n_netcon,
 
 // sizes and total data count
 static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int& ndiam,
-  int& nmech, int*& tml_index, int*& ml_nodecount, int& nidata,
-  int& nvdata, int*& ml_vdata_offset, int& nweight) {
+  int& nmech, int*& tml_index, int*& ml_nodecount, int& nidata, int& nvdata, int& nweight) {
   
   if (tid >= nrn_nthread) { return 0; }
   CellGroup& cg = cellgroups_[tid];
@@ -1120,12 +1121,8 @@ static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int
   ndiam = cg.ndiam;
   nmech = cg.n_mech;
 
-  ml_vdata_offset = new int[n_memb_func];
+  cg.ml_vdata_offset = new int[nmech];
   int vdata_offset = 0;
-  int i;
-  for (i=0; i < n_memb_func; ++i) {
-    ml_vdata_offset[i] = -1; // for nt._vdata
-  }
   tml_index = new int[nmech];
   ml_nodecount = new int[nmech];
   MlWithArt& mla = cg.mlwithart;
@@ -1134,7 +1131,7 @@ static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int
     Memb_list* ml = mla[j].second;
     tml_index[j] = type;
     ml_nodecount[j] = ml->nodecount;
-    ml_vdata_offset[type] = vdata_offset;
+    cg.ml_vdata_offset[j] = vdata_offset;
     int* ds = memb_func[type].dparam_semantics;
     for (int psz=0; psz < bbcore_dparam_size[type]; ++psz) {
       if (ds[psz] == -4 || ds[psz] == -6 || ds[psz] == -7 || ds[psz] == 0) {
@@ -1145,7 +1142,7 @@ static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int
   }
   nvdata = vdata_offset;
   //  printf("nidata=%d nvdata=%d nnetcon=%d\n", 0, nvdata, cg.n_netcon);
-  for (i=0; i < cg.n_netcon; ++i) {
+  for (int i=0; i < cg.n_netcon; ++i) {
     nweight += cg.netcons[i]->cnt_;
   }
 
@@ -1161,14 +1158,28 @@ static int nrnthread_dat2_2(int tid, int*& v_parent_index, double*& a, double*& 
 
   assert(cg.n_real_output == nt.ncell);
 
-  v_parent_index = nt._v_parent_index;
-  a = nt._actual_a;
-  b = nt._actual_b;
-  area = nt._actual_area;
-  v = nt._actual_v;
-  diamvec = NULL;
+  // if not NULL then copy (for direct transfer target space already allocated)
+  bool copy = v_parent_index ? true : false;
+  int n = nt.end;
+  if (copy) {
+    for (int i=0; i < nt.end; ++i) {
+      v_parent_index[i] = nt._v_parent_index[i];
+      a[i] = nt._actual_a[i];
+      b[i] = nt._actual_b[i];
+      area[i] = nt._actual_area[i];
+      v[i] = nt._actual_v[i];
+    }
+  }else{
+    v_parent_index = nt._v_parent_index;
+    a = nt._actual_a;
+    b = nt._actual_b;
+    area = nt._actual_area;
+    v = nt._actual_v;
+  }
   if (cg.ndiam) {
-    diamvec = new double[nt.end];
+    if (!copy) {
+      diamvec = new double[nt.end];
+    }
     for (int i=0; i < nt.end; ++i) {
       Node* nd = nt._v_node[i];
       double diam = 0.0;
@@ -1184,7 +1195,7 @@ static int nrnthread_dat2_2(int tid, int*& v_parent_index, double*& a, double*& 
   return 1;
 }
 
-static int nrnthread_dat2_mech(int tid, size_t i, int vdata_offset, int dsz_inst, int*& nodeindices,
+static int nrnthread_dat2_mech(int tid, size_t i, int dsz_inst, int*& nodeindices,
   double*& data, int*& pdata) {
 
   if (tid >= nrn_nthread) { return 0; }
@@ -1193,21 +1204,48 @@ static int nrnthread_dat2_mech(int tid, size_t i, int vdata_offset, int dsz_inst
   MlWithArtItem& mlai = cg.mlwithart[i];
   int type = mlai.first;
   Memb_list* ml = mlai.second;
+  // for direct transfer, data=NULL means copy into passed space for nodeindices, data, and pdata
+  bool copy = data ? true : false;
 
+    int vdata_offset = cg.ml_vdata_offset[i];
     int isart = nrn_is_artificial_[type];
     int n = ml->nodecount;
     int sz = nrn_prop_param_size_[type];
+    double* data1;
     if (isart) { // data may not be contiguous
-      data = contiguous_art_data(ml->data, n, sz); // delete after use
+      data1 = contiguous_art_data(ml->data, n, sz); // delete after use
       nodeindices = NULL;
     }else{
       nodeindices = ml->nodeindices;
-      data = ml->data[0]; // do not delete after use
+      data1 = ml->data[0]; // do not delete after use
+    }
+    if (copy) {
+      if (!isart) for (int i=0; i < n; ++i) {
+        nodeindices[i] = ml->nodeindices[i];
+      }
+      int nn = n*sz;
+      for (int i = 0; i < nn; ++i) {
+        data[i] = data1[i];
+      }
+      if (isart) {
+        delete [] data1;
+      }
+    }else{
+      data = data1;
     }
 
     sz = bbcore_dparam_size[type]; // nrn_prop_dparam_size off by 1 if cvode_ieq.
     if (sz) {
-      pdata = datum2int(type, ml, nt, cg, cg.datumindices[dsz_inst], vdata_offset);
+      int* pdata1;
+      pdata1 = datum2int(type, ml, nt, cg, cg.datumindices[dsz_inst], vdata_offset);
+      if (copy) {
+        int nn = n*sz;
+        for (int i=0; i < nn; ++i) {
+          pdata[i] = pdata1[i];
+        }
+      }else{
+        pdata = pdata1;
+      }
     }else{
       pdata = NULL;
     }
@@ -1268,14 +1306,13 @@ static int nrnthread_dat2_corepointer(int tid, int& n) {
   return 1;
 }
 
-static int nrnthread_dat2_corepointer_mech(int tid, size_t i,
+static int nrnthread_dat2_corepointer_mech(int tid, int type,
  int& icnt, int& dcnt, int*& iArray, double*& dArray) {
 
   if (tid >= nrn_nthread) { return 0; }
   NrnThread& nt = nrn_threads[tid];
-  MlWithArtItem& mlai = cellgroups_[tid].mlwithart[i];
-  int type = mlai.first;
-  Memb_list* ml = mlai.second;
+  CellGroup& cg = cellgroups_[tid];
+  Memb_list* ml = cg.type2ml[type];
 
       dcnt = 0;
       icnt = 0;
@@ -1333,10 +1370,9 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
 
   // sizes and total data count
   int ngid, n_real_gid, nnode, ndiam, nmech, *tml_index, *ml_nodecount, nidata,
-    nvdata, *ml_vdata_offset, nweight;
+    nvdata, nweight;
   nrnthread_dat2_1(nt.id, ngid, n_real_gid, nnode, ndiam,
-    nmech, tml_index, ml_nodecount, nidata,
-    nvdata, ml_vdata_offset, nweight);
+    nmech, tml_index, ml_nodecount, nidata, nvdata, nweight);
 
   fprintf(f, "%d ngid\n", ngid);
   fprintf(f, "%d n_real_gid\n", n_real_gid);
@@ -1354,7 +1390,7 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
   fprintf(f, "%d nweight\n", nweight);
 
   // data
-  int *v_parent_index; double *a, *b, *area, *v, *diamvec;
+  int *v_parent_index=NULL; double *a=NULL, *b=NULL, *area=NULL, *v=NULL, *diamvec=NULL;
   nrnthread_dat2_2(nt.id, v_parent_index, a, b, area, v, diamvec);
   assert(cg.n_real_output == nt.ncell);
   writeint(nt._v_parent_index, nt.end);
@@ -1372,8 +1408,8 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
   MlWithArt& mla = cg.mlwithart;
   for (size_t i = 0; i < mla.size(); ++i) {
     int type = mla[i].first;
-    int *nodeindices, *pdata; double* data;
-    nrnthread_dat2_mech(nt.id, i, ml_vdata_offset[type], dsz_inst, nodeindices, data, pdata);
+    int *nodeindices=NULL, *pdata=NULL; double* data=NULL;
+    nrnthread_dat2_mech(nt.id, i, dsz_inst, nodeindices, data, pdata);
     Memb_list* ml = mla[i].second;
     int n = ml->nodecount;
     int sz = nrn_prop_param_size_[type];
@@ -1391,7 +1427,6 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
       delete [] pdata;
     }
   }
-  delete [] ml_vdata_offset;
 
   int *output_vindex, *netcon_pnttype, *netcon_pntindex;
   double *output_threshold, *weights, *delays;
@@ -1421,7 +1456,7 @@ void write_nrnthread(const char* path, NrnThread& nt, CellGroup& cg) {
     int type = mla[i].first;
     if (nrn_bbcore_write_[type]) {
       int icnt, dcnt, *iArray; double* dArray;
-      nrnthread_dat2_corepointer_mech(nt.id, i, icnt, dcnt, iArray, dArray);
+      nrnthread_dat2_corepointer_mech(nt.id, type, icnt, dcnt, iArray, dArray);
       fprintf(f, "%d\n", type);
       fprintf(f, "%d\n%d\n", icnt, dcnt);
       if (icnt) {
