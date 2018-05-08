@@ -1141,7 +1141,9 @@ static int nrnthread_dat2_1(int tid, int& ngid, int& n_real_gid, int& nnode, int
     }
   }
   nvdata = vdata_offset;
-  //  printf("nidata=%d nvdata=%d nnetcon=%d\n", 0, nvdata, cg.n_netcon);
+  nidata = 0;
+  //  printf("nidata=%d nvdata=%d nnetcon=%d\n", nidata, nvdata, cg.n_netcon);
+  nweight = 0;
   for (int i=0; i < cg.n_netcon; ++i) {
     nweight += cg.netcons[i]->cnt_;
   }
