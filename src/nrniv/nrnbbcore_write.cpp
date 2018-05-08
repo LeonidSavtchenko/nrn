@@ -1774,7 +1774,7 @@ int nrncore_run() {
   }
   void* handle = dlopen(corenrn_lib, RTLD_NOW|RTLD_GLOBAL);
   if (!handle) {   
-    hoc_execerror("Could not dlopen NRN_PYLIB: ", corenrn_lib);
+    hoc_execerror("Could not dlopen $CORENEURONLIB: ", corenrn_lib);
   }
   for (int i=0; cnbs[i].name; ++i) {
     void* sym = dlsym(handle, cnbs[i].name);
