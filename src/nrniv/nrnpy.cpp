@@ -101,12 +101,14 @@ static void p_destruct(void* v) {
 static Member_func p_members[] = {0,0};
 
 #if NRNPYTHON_DYNAMICLOAD
-static char* pyhome;
+char* nrnpy_pyhome;
+static char* nrn_pylib;
+
 static void siteprob(void) {
 	if (nrnpy_site_problem_p && (*nrnpy_site_problem_p)) {
 printf("Py_Initialize exited. PYTHONHOME probably needs to be set correctly.\n");
-		if(pyhome) {
-printf("Our automatic guess based on the Python shared library location:\n    export PYTHONHOME=%s\ndid not work.\n", pyhome);
+		if(nrnpy_pyhome) {
+printf("Our automatic guess based on the Python shared library location:\n    export PYTHONHOME=%s\ndid not work.\n", nrnpy_pyhome);
 		}
 printf("It will help to examine the output of:\nnrnpyenv.sh\n\
 and set the indicated environment variables, or avoid python by adding\n\
@@ -114,6 +116,32 @@ nopython: on\n\
 to %s/lib/nrn.defaults (or .nrn.defaults in your $HOME directory)\n",
 neuron_home);
 	}
+}
+
+static void set_nrnpylib() {
+	nrn_pylib = getenv("NRN_PYLIB");
+	nrnpy_pyhome = getenv("PYTHONHOME");
+	if (nrn_pylib && nrnpy_pyhome) { return; }
+	FILE* p = popen("bash nrnpyenv.sh", "r");
+	if (!p) {
+		printf("could not popen 'bash nrnpyenv.sh'\n");
+		return;
+	}
+	char line[1024];
+	while(fgets(line, 1024, p)) {
+		char* cp;
+		// must get rid of beginning '"' and trailing '"\n'
+		if (!nrnpy_pyhome && (cp = strstr(line, "export PYTHONHOME="))) {
+			cp += 19;
+			cp[strlen(cp) - 2] = '\0';
+			nrnpy_pyhome = strdup(cp);
+		}else if (!nrn_pylib && (cp = strstr(line, "export NRN_PYLIB="))) {
+			cp += 18;
+			cp[strlen(cp) - 2] = '\0';
+			nrn_pylib = strdup(cp);
+		}
+	}
+	pclose(p);
 }
 
 static void set_pythonhome(void* handle){
@@ -127,8 +155,8 @@ static void set_pythonhome(void* handle){
 	int success = dladdr(s, &dl_info);
 	if (success) {
 		//printf("%s\n", dl_info.dli_fname);
-		pyhome = strdup(dl_info.dli_fname);
-		char* p = pyhome;
+		nrnpy_pyhome = strdup(dl_info.dli_fname);
+		char* p = nrnpy_pyhome;
 		int n = strlen(p);
 		int seen = 0;
 		for (int i = n-1; i > 0; --i) {
@@ -156,11 +184,12 @@ void nrnpython_reg() {
     }else{
 #if NRNPYTHON_DYNAMICLOAD
 	void* handle = NULL;
-	char* nrn_pylib = NULL;
 
       if (!nrn_is_python_extension) {
 	// As last resort (or for python3) load $NRN_PYLIB
-	nrn_pylib = getenv("NRN_PYLIB");
+	set_nrnpylib();
+	//printf("nrn_pylib %s\n", nrn_pylib);
+	//printf("nrnpy_pyhome %s\n", nrnpy_pyhome);
 	if (nrn_pylib) {
 		handle = dlopen(nrn_pylib, RTLD_NOW|RTLD_GLOBAL);
 		if (!handle) {
